@@ -20,6 +20,30 @@ def health():
     return jsonify({"status": "ok"})
 
 
+def extract_images(html):
+    # 1. Ищем origUrl
+    urls = re.findall(r'"origUrl":"(https:[^"]+)"', html)
+
+    # 2. fallback — ищем CDN Яндекса
+    if not urls:
+        urls = re.findall(r'https://avatars\.mds\.yandex\.net/[^\s"<>]+', html)
+
+    # 3. fallback — любые изображения
+    if not urls:
+        urls = re.findall(r'https?://[^\s"<>]+\.(jpg|jpeg|png|webp)', html)
+
+    # очищаем
+    clean = []
+    for u in urls:
+        if isinstance(u, tuple):
+            continue
+        u = u.replace("\\/", "/")
+        if u not in clean:
+            clean.append(u)
+
+    return clean
+
+
 @app.route("/save-file", methods=["POST"])
 def save_file():
     try:
@@ -29,50 +53,44 @@ def save_file():
         if not url:
             return jsonify({"error": "url is required"}), 400
 
-        # Загружаем страницу
         response = requests.get(url, headers=HEADERS, timeout=20)
         response.raise_for_status()
 
         html = response.text
 
-        # 🔥 ИЩЕМ origUrl (оригинальные фото)
-        matches = re.findall(r'"origUrl":"(https:[^"]+)"', html)
-
-        # Убираем дубликаты
-        image_urls = list(dict.fromkeys(matches))
+        image_urls = extract_images(html)
 
         if not image_urls:
             return jsonify({
                 "status": "ok",
                 "files_found": 0,
                 "download_url": None,
-                "message": "Gallery not found"
+                "message": "Images not found"
             })
 
-        # Создаём папку
         job_id = str(uuid.uuid4())
         folder_path = os.path.join(DOWNLOAD_FOLDER, job_id)
         os.makedirs(folder_path, exist_ok=True)
 
         saved_files = []
 
-        # Скачиваем фото
         for i, img_url in enumerate(image_urls, start=1):
             try:
-                img_url = img_url.replace("\\/", "/")
+                img = requests.get(img_url, headers=HEADERS, timeout=20)
+                img.raise_for_status()
 
-                img_response = requests.get(img_url, headers=HEADERS, timeout=30)
-                img_response.raise_for_status()
+                if len(img.content) < 10000:
+                    continue  # отсекаем мусор
 
-                file_name = f"image_{i}.jpg"
-                file_path = os.path.join(folder_path, file_name)
+                filename = f"image_{i}.jpg"
+                path = os.path.join(folder_path, filename)
 
-                with open(file_path, "wb") as f:
-                    f.write(img_response.content)
+                with open(path, "wb") as f:
+                    f.write(img.content)
 
-                saved_files.append(file_name)
+                saved_files.append(filename)
 
-            except Exception:
+            except:
                 continue
 
         if not saved_files:
@@ -80,17 +98,15 @@ def save_file():
                 "status": "ok",
                 "files_found": 0,
                 "download_url": None,
-                "message": "Images found but failed to download"
+                "message": "Images detected but not downloaded"
             })
 
-        # Создаём ZIP
         zip_name = f"{job_id}.zip"
         zip_path = os.path.join(DOWNLOAD_FOLDER, zip_name)
 
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for file_name in saved_files:
-                file_path = os.path.join(folder_path, file_name)
-                zipf.write(file_path, arcname=file_name)
+        with zipfile.ZipFile(zip_path, "w") as zipf:
+            for file in saved_files:
+                zipf.write(os.path.join(folder_path, file), file)
 
         return jsonify({
             "status": "ok",
@@ -102,7 +118,7 @@ def save_file():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/download/<path:filename>", methods=["GET"])
+@app.route("/download/<path:filename>")
 def download_file(filename):
     return send_from_directory(DOWNLOAD_FOLDER, filename, as_attachment=True)
 
