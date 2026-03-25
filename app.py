@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 import traceback
 import os
@@ -7,64 +7,61 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return {"status": "ok"}
 
 @app.route("/save-file", methods=["POST"])
 def save_file():
     try:
-        print("START REQUEST", flush=True)
+        data = request.get_json() or {}
+        url = data.get("url")
 
-        data = request.get_json(silent=True) or {}
-        incoming_url = data.get("url")
-        print(f"INCOMING URL: {incoming_url}", flush=True)
+        if not url:
+            return {"error": "url required"}, 400
 
         with sync_playwright() as p:
-            print("PLAYWRIGHT OK", flush=True)
-
             browser = p.chromium.launch(
                 headless=True,
                 args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--no-zygote",
-                    "--single-process"
+                    "--disable-dev-shm-usage"
                 ]
             )
 
-            print("BROWSER STARTED", flush=True)
-
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 900},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
                 locale="ru-RU"
             )
 
             page = context.new_page()
-            print("PAGE CREATED", flush=True)
 
-            page.goto("https://example.com", wait_until="domcontentloaded", timeout=60000)
-            print("PAGE OPENED", flush=True)
+            # открываем страницу
+            page.goto(url, timeout=60000)
 
-            title = page.title()
-            print(f"TITLE: {title}", flush=True)
+            # даем JS время
+            page.wait_for_timeout(5000)
+
+            # получаем все картинки
+            images = page.locator("img").all()
+
+            urls = []
+
+            for img in images:
+                src = img.get_attribute("src")
+                if src and "yandex" in src:
+                    urls.append(src)
 
             browser.close()
-            print("BROWSER CLOSED", flush=True)
 
-        return jsonify({
+        return {
             "status": "ok",
-            "message": "Playwright launched successfully",
-            "title": title
-        })
+            "found": len(urls),
+            "images": urls[:20]
+        }
 
     except Exception as e:
-        print("ERROR:", str(e), flush=True)
-        print(traceback.format_exc(), flush=True)
-        return jsonify({
-            "error": str(e)
-        }), 500
+        print(traceback.format_exc())
+        return {"error": str(e)}, 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
