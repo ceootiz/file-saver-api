@@ -94,7 +94,7 @@ def save_file():
     return jsonify({
         "status": "ok",
         "files_found": len(saved_files),
-        "download_url": f"/download/{zip_filename}"
+        ""download_url": request.host_url + f"download/{zip_filename}""
     })
 
 @app.route("/download/<path:filename>", methods=["GET"])
