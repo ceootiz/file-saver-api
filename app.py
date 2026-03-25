@@ -4,7 +4,6 @@ import requests
 import os
 import zipfile
 import uuid
-import time
 
 app = Flask(__name__)
 
@@ -12,7 +11,7 @@ DOWNLOAD_FOLDER = "downloads"
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": "Mozilla/5.0"
 }
 
 
@@ -21,65 +20,70 @@ def health():
     return jsonify({"status": "ok"})
 
 
-def safe_filename(index: int, url: str) -> str:
-    ext = ".jpg"
-    lower = url.lower()
-    for candidate in [".jpg", ".jpeg", ".png", ".webp"]:
-        if candidate in lower:
-            ext = ".jpg" if candidate == ".jpeg" else candidate
-            break
-    return f"image_{index}{ext}"
-
-
-def normalize_image_url(url: str) -> str:
+def normalize_url(url: str) -> str:
     if not url:
-        return url
+        return ""
     url = url.strip()
     if url.startswith("//"):
         url = "https:" + url
     return url
 
 
-def collect_visible_images(page):
+def safe_filename(index: int, url: str) -> str:
+    lower = url.lower()
+    ext = ".jpg"
+
+    for candidate in [".jpg", ".jpeg", ".png", ".webp"]:
+        if candidate in lower:
+            ext = ".jpg" if candidate == ".jpeg" else candidate
+            break
+
+    return f"image_{index}{ext}"
+
+
+def collect_candidate_images(page):
     js = """
     () => {
       const imgs = Array.from(document.querySelectorAll('img'));
-      return imgs.map(img => {
-        const r = img.getBoundingClientRect();
+      return imgs.map((img, index) => {
+        const rect = img.getBoundingClientRect();
         return {
+          index,
           src: img.currentSrc || img.src || '',
-          x: r.x,
-          y: r.y,
-          w: r.width,
-          h: r.height,
-          area: r.width * r.height,
-          visible: r.width > 20 && r.height > 20
+          alt: img.alt || '',
+          className: img.className || '',
+          width: rect.width,
+          height: rect.height,
+          x: rect.x,
+          y: rect.y
         };
-      }).filter(x => x.visible && x.src);
+      }).filter(x => x.src);
     }
     """
     return page.evaluate(js)
 
 
-def choose_main_image(page):
-    images = collect_visible_images(page)
-
-    # берём самую большую видимую картинку в центральной области
+def get_main_image(page):
+    images = collect_candidate_images(page)
     candidates = []
+
     for img in images:
-        src = normalize_image_url(img["src"])
+        src = normalize_url(img["src"])
         if not src.startswith("http"):
             continue
 
-        # отсекаем иконки/мусор
-        if img["w"] < 250 or img["h"] < 250:
+        # главное фото обычно крупное
+        if img["width"] < 250 or img["height"] < 250:
             continue
 
-        # больше шанс, что это главное фото товара, если картинка ближе к центру
-        score = img["area"]
+        score = img["width"] * img["height"]
 
-        # слегка штрафуем за левую колонку
-        if img["x"] < 250:
+        # центральная область лучше
+        if img["x"] > 220:
+            score += 50000
+
+        # левая зона миниатюр хуже
+        if img["x"] < 220:
             score -= 100000
 
         candidates.append((score, src))
@@ -91,39 +95,37 @@ def choose_main_image(page):
     return candidates[0][1]
 
 
-def get_thumbnail_indices(page):
+def get_thumbnail_positions(page):
     js = """
     () => {
       const imgs = Array.from(document.querySelectorAll('img'));
       const thumbs = [];
 
-      imgs.forEach((img, idx) => {
-        const r = img.getBoundingClientRect();
+      imgs.forEach((img, index) => {
+        const rect = img.getBoundingClientRect();
         const src = img.currentSrc || img.src || '';
 
-        // миниатюры обычно слева, небольшие, но видимые
-        const isThumb =
-          r.width >= 40 &&
-          r.height >= 40 &&
-          r.width <= 220 &&
-          r.height <= 220 &&
-          r.x < 260 &&
-          r.y > 50 &&
-          src;
+        const likelyThumb =
+          src &&
+          rect.width >= 40 &&
+          rect.height >= 40 &&
+          rect.width <= 220 &&
+          rect.height <= 220 &&
+          rect.x < 260 &&
+          rect.y > 50;
 
-        if (isThumb) {
+        if (likelyThumb) {
           thumbs.push({
-            index: idx,
-            x: r.x,
-            y: r.y,
-            w: r.width,
-            h: r.height,
+            index,
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
             src
           });
         }
       });
 
-      // сортируем сверху вниз
       thumbs.sort((a, b) => a.y - b.y);
       return thumbs;
     }
@@ -131,37 +133,38 @@ def get_thumbnail_indices(page):
     return page.evaluate(js)
 
 
-def click_thumbnail_by_order(page, order_index: int):
-    js = f"""
-    (orderIndex) => {{
+def click_thumbnail(page, order_index: int):
+    js = """
+    (orderIndex) => {
       const imgs = Array.from(document.querySelectorAll('img'));
       const thumbs = [];
 
-      imgs.forEach((img) => {{
-        const r = img.getBoundingClientRect();
+      imgs.forEach((img) => {
+        const rect = img.getBoundingClientRect();
         const src = img.currentSrc || img.src || '';
 
-        const isThumb =
-          r.width >= 40 &&
-          r.height >= 40 &&
-          r.width <= 220 &&
-          r.height <= 220 &&
-          r.x < 260 &&
-          r.y > 50 &&
-          src;
+        const likelyThumb =
+          src &&
+          rect.width >= 40 &&
+          rect.height >= 40 &&
+          rect.width <= 220 &&
+          rect.height <= 220 &&
+          rect.x < 260 &&
+          rect.y > 50;
 
-        if (isThumb) {{
-          thumbs.push({{ el: img, y: r.y }});
-        }}
-      }});
+        if (likelyThumb) {
+          thumbs.push({ img, y: rect.y });
+        }
+      });
 
       thumbs.sort((a, b) => a.y - b.y);
 
       if (!thumbs[orderIndex]) return false;
 
-      thumbs[orderIndex].el.click();
+      thumbs[orderIndex].img.scrollIntoView({ block: 'center' });
+      thumbs[orderIndex].img.click();
       return true;
-    }}
+    }
     """
     return page.evaluate(js, order_index)
 
@@ -179,47 +182,56 @@ def save_file():
         folder_path = os.path.join(DOWNLOAD_FOLDER, job_id)
         os.makedirs(folder_path, exist_ok=True)
 
-        found_image_urls = []
+        image_urls = []
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu"
+                ]
+            )
+
             context = browser.new_context(
                 viewport={"width": 1600, "height": 1200},
                 user_agent=HEADERS["User-Agent"]
             )
-            page = context.new_page()
 
+            page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(5000)
 
-            # если есть главное фото сразу — забираем
-            first_main = choose_main_image(page)
+            # 1. Берём текущее главное фото
+            first_main = get_main_image(page)
             if first_main:
-                found_image_urls.append(first_main)
+                image_urls.append(first_main)
 
-            # пробуем пройти по миниатюрам
-            thumbs = get_thumbnail_indices(page)
+            # 2. Ищем миниатюры и кликаем по каждой
+            thumbs = get_thumbnail_positions(page)
 
             for i in range(len(thumbs)):
                 try:
-                    clicked = click_thumbnail_by_order(page, i)
+                    clicked = click_thumbnail(page, i)
                     if not clicked:
                         continue
 
                     page.wait_for_timeout(1500)
-                    main_img = choose_main_image(page)
-                    if main_img and main_img not in found_image_urls:
-                        found_image_urls.append(main_img)
+
+                    main_img = get_main_image(page)
+                    if main_img and main_img not in image_urls:
+                        image_urls.append(main_img)
 
                 except Exception:
                     continue
 
             browser.close()
 
-        # удаляем дубли
-        found_image_urls = list(dict.fromkeys(found_image_urls))
+        image_urls = [normalize_url(u) for u in image_urls if normalize_url(u)]
+        image_urls = list(dict.fromkeys(image_urls))
 
-        if not found_image_urls:
+        if not image_urls:
             return jsonify({
                 "status": "ok",
                 "files_found": 0,
@@ -229,9 +241,8 @@ def save_file():
 
         saved_files = []
 
-        for i, img_url in enumerate(found_image_urls, start=1):
+        for i, img_url in enumerate(image_urls, start=1):
             try:
-                img_url = normalize_image_url(img_url)
                 resp = requests.get(
                     img_url,
                     headers={
@@ -242,6 +253,7 @@ def save_file():
                 )
                 resp.raise_for_status()
 
+                # отсечь мелкий мусор
                 if len(resp.content) < 15000:
                     continue
 
