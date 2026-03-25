@@ -5,21 +5,14 @@ from urllib.parse import urljoin, urlparse
 import os
 import zipfile
 import uuid
+import re
 
 app = Flask(__name__)
 
 DOWNLOAD_FOLDER = "downloads"
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-# Какие типы считаем файлами
-ALLOWED_EXTENSIONS = [
-    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".svg",
-    ".pdf", ".zip", ".rar", ".7z",
-    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".txt", ".csv",
-    ".mp4", ".mov", ".avi", ".mkv",
-    ".mp3", ".wav"
-]
+IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".svg"]
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
@@ -31,23 +24,23 @@ def health():
     return jsonify({"status": "ok"})
 
 
-def is_allowed_file(url: str) -> bool:
+def is_image_url(url: str) -> bool:
     path = urlparse(url).path.lower()
-    return any(path.endswith(ext) for ext in ALLOWED_EXTENSIONS)
+    return any(path.endswith(ext) for ext in IMAGE_EXTENSIONS)
 
 
-def make_safe_filename(url: str, fallback_prefix: str = "file") -> str:
+def make_safe_filename(url: str, fallback_prefix: str = "image") -> str:
     parsed = urlparse(url)
     filename = os.path.basename(parsed.path)
 
     if not filename:
-        filename = f"{fallback_prefix}_{uuid.uuid4().hex[:8]}"
+        filename = f"{fallback_prefix}_{uuid.uuid4().hex[:8]}.jpg"
 
     filename = filename.split("?")[0].split("#")[0]
     filename = filename.replace("/", "_").replace("\\", "_").strip()
 
     if not filename:
-        filename = f"{fallback_prefix}_{uuid.uuid4().hex[:8]}"
+        filename = f"{fallback_prefix}_{uuid.uuid4().hex[:8]}.jpg"
 
     return filename
 
@@ -61,38 +54,52 @@ def save_file():
         if not url:
             return jsonify({"error": "url is required"}), 400
 
-        # Открываем страницу
         page_response = requests.get(url, headers=HEADERS, timeout=20)
         page_response.raise_for_status()
 
         soup = BeautifulSoup(page_response.text, "html.parser")
-        found_urls = []
+        found_urls = set()
 
-        # 1. Ищем обычные ссылки на файлы
+        # 1. Обычные img
+        for img in soup.find_all("img"):
+            for attr in ["src", "data-src", "data-original", "data-lazy-src"]:
+                val = img.get(attr)
+                if val:
+                    full_url = urljoin(url, val.strip())
+                    if full_url.startswith("http") and is_image_url(full_url):
+                        found_urls.add(full_url)
+
+            # srcset
+            srcset = img.get("srcset")
+            if srcset:
+                parts = [p.strip().split(" ")[0] for p in srcset.split(",")]
+                for part in parts:
+                    full_url = urljoin(url, part)
+                    if full_url.startswith("http") and is_image_url(full_url):
+                        found_urls.add(full_url)
+
+        # 2. Ссылки внутри <a>
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             full_url = urljoin(url, href)
+            if full_url.startswith("http") and is_image_url(full_url):
+                found_urls.add(full_url)
 
-            if is_allowed_file(full_url):
-                found_urls.append(full_url)
+        # 3. Ищем прямые ссылки на картинки в script / html
+        html_text = page_response.text
+        pattern = r'https?://[^\s"\'<>]+(?:\.jpg|\.jpeg|\.png|\.webp|\.gif|\.bmp|\.svg)'
+        matches = re.findall(pattern, html_text, flags=re.IGNORECASE)
+        for match in matches:
+            found_urls.add(match)
 
-        # 2. Ищем картинки
-        for img in soup.find_all("img", src=True):
-            src = img["src"].strip()
-            full_url = urljoin(url, src)
-
-            if is_allowed_file(full_url):
-                found_urls.append(full_url)
-
-        # Убираем дубликаты
-        found_urls = list(dict.fromkeys(found_urls))
+        found_urls = list(found_urls)
 
         if not found_urls:
             return jsonify({
                 "status": "ok",
                 "files_found": 0,
                 "download_url": None,
-                "message": "No accessible files found on the page"
+                "message": "No accessible images found on the page"
             })
 
         job_id = str(uuid.uuid4())
@@ -106,7 +113,11 @@ def save_file():
                 file_response = requests.get(file_url, headers=HEADERS, timeout=30)
                 file_response.raise_for_status()
 
-                filename = make_safe_filename(file_url, fallback_prefix=f"file_{idx}")
+                content_type = file_response.headers.get("Content-Type", "").lower()
+                if not ("image" in content_type or is_image_url(file_url)):
+                    continue
+
+                filename = make_safe_filename(file_url, fallback_prefix=f"image_{idx}")
                 file_path = os.path.join(folder_path, filename)
 
                 with open(file_path, "wb") as f:
@@ -115,7 +126,6 @@ def save_file():
                 saved_files.append(filename)
 
             except Exception:
-                # пропускаем битые/закрытые ссылки, но не падаем всем запросом
                 continue
 
         if not saved_files:
@@ -123,10 +133,9 @@ def save_file():
                 "status": "ok",
                 "files_found": 0,
                 "download_url": None,
-                "message": "Files were detected, but could not be downloaded"
+                "message": "Images were detected, but could not be downloaded"
             })
 
-        # Создаём ZIP
         zip_filename = f"{job_id}.zip"
         zip_path = os.path.join(DOWNLOAD_FOLDER, zip_filename)
 
